@@ -1,1 +1,546 @@
+// ═══════════════════════════════════════════════════════════════
+//  GOOGLE SHEETS URL (вставьте ваш)
+// ═══════════════════════════════════════════════════════════════
+const GOOGLE_SHEETS_URL = 'https://script.google.com/macros/s/AKfycbygXrhZGoVmgZGOUfXS52Z-hKB9maSit9CDkOuDW7cgNfnsUQ8MP-2emiQarvVMcH_m/exec';
 
+// ═══════════════════════════════════════════════════════════════
+//  КОНФИГУРАЦИЯ PEERJS
+// ═══════════════════════════════════════════════════════════════
+const PEER_SERVERS = [
+  { host: '0.peerjs.com', port: 443, secure: true },
+  { host: '1.peerjs.com', port: 443, secure: true },
+  { host: 'eu0.peerjs.com', port: 443, secure: true }
+];
+
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+];
+
+// ═══════════════════════════════════════════════════════════════
+//  ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ
+// ═══════════════════════════════════════════════════════════════
+let peer = null;
+let currentCall = null;
+let localStream = null;
+let dataChannel = null;
+let currentServerIndex = 0;
+let myCode = null;
+let myUUID = null;
+let incomingCall = null;
+
+let micEnabled = true;
+let videoEnabled = true;
+let chatOpen = false;
+let callSeconds = 0;
+let timerInterval = null;
+let statsInterval = null;
+let facingMode = 'user';
+let lastLost = 0, lastRecv = 0;
+
+// DOM элементы
+const myIdVal = document.getElementById('myIdVal');
+const copyBtn = document.getElementById('copyBtn');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+const callInput = document.getElementById('callInput');
+const callBtn = document.getElementById('callBtn');
+const screenWait = document.getElementById('screen-wait');
+const screenCall = document.getElementById('screen-call');
+const screenIncoming = document.getElementById('screen-incoming');
+const incomingIdSpan = document.getElementById('incomingId');
+const remoteVideo = document.getElementById('remoteVideo');
+const localVideo = document.getElementById('localVideo');
+const callTimer = document.getElementById('callTimer');
+const qualityDot = document.getElementById('qualityDot');
+const qualityText = document.getElementById('qualityText');
+const weakBanner = document.getElementById('weakBanner');
+const noVideoOverlay = document.getElementById('noVideoOverlay');
+const btnMic = document.getElementById('btnMic');
+const btnVideo = document.getElementById('btnVideo');
+const btnCamera = document.getElementById('btnCamera');
+const endCallBtn = document.getElementById('endCallBtn');
+const btnChat = document.getElementById('btnChat');
+const chatPanel = document.getElementById('chatPanel');
+const chatMessages = document.getElementById('chatMessages');
+const chatInput = document.getElementById('chatInput');
+const chatSendBtn = document.getElementById('chatSendBtn');
+const chatBadge = document.getElementById('chatBadge');
+
+// ═══════════════════════════════════════════════════════════════
+//  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ═══════════════════════════════════════════════════════════════
+function setStatus(color, text) {
+  statusDot.className = 'status-dot';
+  if (color === 'green') statusDot.classList.add('green');
+  else if (color === 'yellow') statusDot.classList.add('yellow');
+  else if (color === 'red') statusDot.classList.add('red');
+  statusText.textContent = text;
+}
+
+function generateCode() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+function showCode(code) {
+  myIdVal.textContent = code.slice(0, 3) + ' ' + code.slice(3);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  РЕГИСТРАЦИЯ КОДА В GOOGLE SHEETS
+// ═══════════════════════════════════════════════════════════════
+async function registerCode(code, uuid) {
+  try {
+    const response = await fetch(GOOGLE_SHEETS_URL, {
+      method: 'POST',
+      body: JSON.stringify({ code: code, uuid: uuid }),
+      headers: { 'Content-Type': 'application/json' }
+    });
+    const result = await response.json();
+    if (result.status === 'ok') {
+      return code;
+    } else {
+      const newCode = generateCode();
+      localStorage.setItem('myCode', newCode);
+      showCode(newCode);
+      return await registerCode(newCode, uuid);
+    }
+  } catch (err) {
+    console.error('Ошибка регистрации:', err);
+    const newCode = generateCode();
+    localStorage.setItem('myCode', newCode);
+    showCode(newCode);
+    return await registerCode(newCode, uuid);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ПОЛУЧЕНИЕ МЕДИА
+// ═══════════════════════════════════════════════════════════════
+async function getLocalStream() {
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facingMode, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 15 } },
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+    localStream = stream;
+    localVideo.srcObject = stream;
+    return stream;
+  } catch (err) {
+    console.error('getUserMedia error:', err);
+    setStatus('red', 'Нет доступа к камере/микрофону');
+    throw err;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  СОЗДАНИЕ PEER
+// ═══════════════════════════════════════════════════════════════
+function createPeer() {
+  if (peer && !peer.destroyed) {
+    try { peer.destroy(); } catch(e) {}
+  }
+
+  const config = PEER_SERVERS[currentServerIndex];
+  console.log(`[Peer] Подключение к ${config.host}`);
+  setStatus('yellow', 'Подключение...');
+
+  const newPeer = new Peer({
+    host: config.host,
+    port: config.port,
+    path: '/',
+    secure: config.secure,
+    config: { iceServers: ICE_SERVERS },
+    debug: 0,
+    pingInterval: 30000,
+    reconnect: true,
+    reconnectAttempts: 3
+  });
+
+  newPeer.on('open', async (uuid) => {
+    console.log(`[Peer] Подключён! UUID: ${uuid}`);
+    myUUID = uuid;
+    
+    const savedCode = localStorage.getItem('myCode');
+    if (savedCode) {
+      myCode = savedCode;
+      showCode(myCode);
+      await registerCode(myCode, myUUID);
+    } else {
+      myCode = generateCode();
+      localStorage.setItem('myCode', myCode);
+      myCode = await registerCode(myCode, myUUID);
+      showCode(myCode);
+    }
+    
+    setStatus('green', 'Готов — можно звонить');
+    callBtn.disabled = false;
+  });
+
+  newPeer.on('call', (call) => {
+    console.log(`[Peer] Входящий звонок от ${call.peer}`);
+    incomingCall = call;
+    const callerCode = call.metadata?.code || '??????';
+    incomingIdSpan.textContent = callerCode;
+    screenIncoming.classList.add('show');
+  });
+
+  newPeer.on('connection', (conn) => {
+    console.log('[Peer] Data channel');
+    setupDataChannel(conn);
+  });
+
+  newPeer.on('error', (err) => {
+    console.error(`[Peer] Ошибка (${config.host}):`, err.type);
+    if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') {
+      if (currentServerIndex + 1 < PEER_SERVERS.length) {
+        currentServerIndex++;
+        createPeer();
+      } else {
+        setStatus('red', 'Серверы недоступны. Обнови страницу.');
+      }
+    }
+  });
+
+  newPeer.on('disconnected', () => {
+    console.log('[Peer] Отключён');
+    setStatus('yellow', 'Переподключение...');
+    if (!newPeer.destroyed) newPeer.reconnect();
+  });
+
+  peer = newPeer;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DATA CHANNEL (ЧАТ)
+// ═══════════════════════════════════════════════════════════════
+function setupDataChannel(conn) {
+  dataChannel = conn;
+  conn.on('data', (data) => {
+    addChatMessage(data, 'them');
+    if (!chatOpen) chatBadge.classList.add('show');
+  });
+}
+
+function sendChatMessage() {
+  const text = chatInput.value.trim();
+  if (!text || !dataChannel || dataChannel.open !== true) return;
+  dataChannel.send(text);
+  addChatMessage(text, 'me');
+  chatInput.value = '';
+}
+
+function addChatMessage(text, from) {
+  const div = document.createElement('div');
+  div.className = `chat-msg ${from}`;
+  div.textContent = text;
+  chatMessages.appendChild(div);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ЗВОНОК ПО КОДУ (через Google Sheets)
+// ═══════════════════════════════════════════════════════════════
+async function startCall() {
+  const targetCode = callInput.value.trim();
+  if (!targetCode || targetCode.length !== 6) return;
+  
+  setStatus('yellow', 'Поиск собеседника...');
+  
+  try {
+    const response = await fetch(`${GOOGLE_SHEETS_URL}?code=${targetCode}`);
+    const result = await response.json();
+    
+    if (result.status !== 'ok' || !result.uuid) {
+      setStatus('red', 'Код не найден. Собеседник не онлайн.');
+      return;
+    }
+    
+    const targetUUID = result.uuid;
+    console.log(`[Call] Найден UUID: ${targetUUID}`);
+    
+    setStatus('yellow', 'Запрашиваем камеру...');
+    await getLocalStream();
+    
+    setStatus('yellow', 'Звонок...');
+    const call = peer.call(targetUUID, localStream, { metadata: { code: myCode } });
+    const conn = peer.connect(targetUUID, { metadata: { code: myCode } });
+    setupDataChannel(conn);
+    handleCall(call);
+    
+  } catch (err) {
+    console.error('[Call] Ошибка:', err);
+    setStatus('red', 'Ошибка при звонке');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ОБРАБОТКА ЗВОНКА
+// ═══════════════════════════════════════════════════════════════
+function handleCall(call) {
+  currentCall = call;
+  
+  call.on('stream', (remoteStream) => {
+    console.log('[Call] Поток получен');
+    remoteVideo.srcObject = remoteStream;
+    showCallScreen();
+    startTimer();
+    startQualityMonitor(call.peerConnection);
+  });
+  
+  call.on('close', () => cleanupCall());
+  call.on('error', () => cleanupCall());
+  
+  const pc = call.peerConnection;
+  if (pc) {
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'failed') cleanupCall();
+    };
+  }
+}
+
+async function acceptCall() {
+  screenIncoming.classList.remove('show');
+  try {
+    await getLocalStream();
+    incomingCall.answer(localStream);
+    handleCall(incomingCall);
+    incomingCall = null;
+  } catch (err) {
+    setStatus('red', 'Не удалось получить камеру');
+    incomingCall = null;
+  }
+}
+
+function rejectCall() {
+  screenIncoming.classList.remove('show');
+  if (incomingCall) {
+    incomingCall.close();
+    incomingCall = null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  УПРАВЛЕНИЕ
+// ═══════════════════════════════════════════════════════════════
+function toggleMic() {
+  if (!localStream) return;
+  micEnabled = !micEnabled;
+  localStream.getAudioTracks().forEach(t => t.enabled = micEnabled);
+  btnMic.classList.toggle('off', !micEnabled);
+}
+
+function toggleVideo() {
+  if (!localStream) return;
+  videoEnabled = !videoEnabled;
+  localStream.getVideoTracks().forEach(t => t.enabled = videoEnabled);
+  btnVideo.classList.toggle('off', !videoEnabled);
+  noVideoOverlay.classList.toggle('show', !videoEnabled);
+  if (videoEnabled) weakBanner.classList.remove('show');
+}
+
+async function switchCamera() {
+  facingMode = facingMode === 'user' ? 'environment' : 'user';
+  try {
+    const newStream = await getLocalStream();
+    if (currentCall && currentCall.peerConnection) {
+      const videoTrack = newStream.getVideoTracks()[0];
+      const sender = currentCall.peerConnection.getSenders().find(s => s.track?.kind === 'video');
+      if (sender && videoTrack) await sender.replaceTrack(videoTrack);
+    }
+  } catch (err) {
+    facingMode = facingMode === 'user' ? 'environment' : 'user';
+  }
+}
+
+function toggleChat() {
+  chatOpen = !chatOpen;
+  chatPanel.classList.toggle('chat-hidden', !chatOpen);
+  btnChat.classList.toggle('off', !chatOpen);
+  if (chatOpen) {
+    chatBadge.classList.remove('show');
+    chatInput.focus();
+  }
+}
+
+function endCall() {
+  if (currentCall) currentCall.close();
+  cleanupCall();
+}
+
+function cleanupCall() {
+  if (timerInterval) clearInterval(timerInterval);
+  if (statsInterval) clearInterval(statsInterval);
+  timerInterval = null;
+  statsInterval = null;
+  callSeconds = 0;
+  callTimer.textContent = '00:00';
+  lastLost = 0; lastRecv = 0;
+  
+  if (localStream) {
+    localStream.getTracks().forEach(t => t.stop());
+    localStream = null;
+  }
+  
+  remoteVideo.srcObject = null;
+  localVideo.srcObject = null;
+  screenCall.classList.remove('show');
+  screenWait.style.display = 'flex';
+  noVideoOverlay.classList.remove('show');
+  weakBanner.classList.remove('show');
+  chatPanel.classList.add('chat-hidden');
+  chatMessages.innerHTML = '';
+  chatBadge.classList.remove('show');
+  
+  micEnabled = true;
+  videoEnabled = true;
+  chatOpen = false;
+  btnMic.classList.remove('off');
+  btnVideo.classList.remove('off');
+  btnChat.classList.remove('off');
+  qualityDot.style.background = 'var(--green)';
+  qualityText.textContent = 'хорошее';
+  
+  currentCall = null;
+  dataChannel = null;
+  setStatus('green', 'Готов — можно звонить');
+}
+
+function showCallScreen() {
+  screenWait.style.display = 'none';
+  screenCall.classList.add('show');
+  setStatus('green', 'В разговоре');
+}
+
+function startTimer() {
+  callSeconds = 0;
+  timerInterval = setInterval(() => {
+    callSeconds++;
+    const m = String(Math.floor(callSeconds / 60)).padStart(2, '0');
+    const s = String(callSeconds % 60).padStart(2, '0');
+    callTimer.textContent = `${m}:${s}`;
+  }, 1000);
+}
+
+function startQualityMonitor(pc) {
+  if (statsInterval) clearInterval(statsInterval);
+  statsInterval = setInterval(async () => {
+    if (!pc) return;
+    try {
+      const stats = await pc.getStats();
+      stats.forEach(stat => {
+        if (stat.type === 'inbound-rtp' && stat.kind === 'video') {
+          const lost = (stat.packetsLost || 0) - lastLost;
+          const recv = (stat.packetsReceived || 0) - lastRecv;
+          lastLost = stat.packetsLost || 0;
+          lastRecv = stat.packetsReceived || 0;
+          const total = lost + recv;
+          const lossRate = total > 0 ? lost / total : 0;
+          
+          if (lossRate > 0.1) {
+            qualityDot.style.background = 'var(--red)';
+            qualityText.textContent = 'плохое';
+            weakBanner.classList.add('show');
+            if (videoEnabled && localStream) {
+              localStream.getVideoTracks().forEach(t => t.enabled = false);
+              videoEnabled = false;
+              btnVideo.classList.add('off');
+              noVideoOverlay.classList.add('show');
+            }
+          } else if (lossRate > 0.03) {
+            qualityDot.style.background = 'var(--yellow)';
+            qualityText.textContent = 'среднее';
+            weakBanner.classList.remove('show');
+          } else {
+            qualityDot.style.background = 'var(--green)';
+            qualityText.textContent = 'хорошее';
+            weakBanner.classList.remove('show');
+          }
+        }
+      });
+    } catch (e) {}
+  }, 5000);
+}
+
+function setupPipDrag() {
+  const pip = document.getElementById('pipWrap');
+  let dragging = false, startX = 0, startY = 0, startLeft = 0, startTop = 0;
+  
+  pip.addEventListener('pointerdown', (e) => {
+    dragging = true;
+    pip.setPointerCapture(e.pointerId);
+    const rect = pip.getBoundingClientRect();
+    const parentRect = pip.parentElement.getBoundingClientRect();
+    startX = e.clientX;
+    startY = e.clientY;
+    startLeft = rect.left - parentRect.left;
+    startTop = rect.top - parentRect.top;
+    pip.style.transition = 'none';
+    e.preventDefault();
+  });
+  
+  pip.addEventListener('pointermove', (e) => {
+    if (!dragging) return;
+    const parentRect = pip.parentElement.getBoundingClientRect();
+    let left = startLeft + (e.clientX - startX);
+    let top = startTop + (e.clientY - startY);
+    left = Math.max(8, Math.min(parentRect.width - pip.offsetWidth - 8, left));
+    top = Math.max(8, Math.min(parentRect.height - pip.offsetHeight - 8, top));
+    pip.style.right = 'auto';
+    pip.style.bottom = 'auto';
+    pip.style.left = left + 'px';
+    pip.style.top = top + 'px';
+  });
+  
+  pip.addEventListener('pointerup', () => {
+    dragging = false;
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ИНИЦИАЛИЗАЦИЯ
+// ═══════════════════════════════════════════════════════════════
+window.addEventListener('load', () => {
+  createPeer();
+  setupPipDrag();
+  
+  copyBtn.onclick = copyId;
+  callBtn.onclick = startCall;
+  endCallBtn.onclick = endCall;
+  btnMic.onclick = toggleMic;
+  btnVideo.onclick = toggleVideo;
+  btnCamera.onclick = switchCamera;
+  btnChat.onclick = toggleChat;
+  chatSendBtn.onclick = sendChatMessage;
+  chatInput.onkeydown = (e) => { if (e.key === 'Enter') sendChatMessage(); };
+  
+  document.getElementById('acceptCallBtn').onclick = acceptCall;
+  document.getElementById('rejectCallBtn').onclick = rejectCall;
+  
+  callInput.addEventListener('input', () => {
+    callBtn.disabled = callInput.value.trim().length !== 6;
+  });
+});
+
+function copyId() {
+  const code = myIdVal.textContent.replace(/\s/g, '');
+  if (!code || code === '——') return;
+  navigator.clipboard.writeText(code).then(() => {
+    copyBtn.textContent = '✓ Скопировано';
+    copyBtn.classList.add('copied');
+    setTimeout(() => {
+      copyBtn.textContent = 'Копировать';
+      copyBtn.classList.remove('copied');
+    }, 2000);
+  });
+}
+
+</script>
+</body>
+</html>
