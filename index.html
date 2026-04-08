@@ -656,6 +656,16 @@ function make6digit() {
   return String(Math.floor(100000 + Math.random() * 900000));
 }
 
+// PeerJS-серверы могут отклонять чисто числовые ID.
+// Добавляем префикс 'vc' для надёжности, но показываем пользователю только цифры.
+function toServerId(displayId) {
+  return 'vc' + displayId;  // напр. "vc140926"
+}
+function toDisplayId(serverId) {
+  // убираем префикс 'vc' если он есть
+  return serverId.startsWith('vc') ? serverId.slice(2) : serverId;
+}
+
 function initApp() {
   let savedId = localStorage.getItem('myPeerId');
   if (!savedId || !/^\d{6}$/.test(savedId)) {
@@ -694,7 +704,7 @@ function initPeer(customId) {
     debug: 2,  // 1=errors, 2=warnings+errors, 3=all
     pingInterval: 5000,
   };
-  if (customId) opts.id = customId;
+  if (customId) opts.id = toServerId(customId);  // "vc140926" вместо "140926"
 
   // Если старый peer жив — уничтожаем
   if (peer && !peer.destroyed) {
@@ -721,20 +731,44 @@ function initPeer(customId) {
   peer.once('open', () => clearTimeout(connectTimeout));
 
   peer.on('open', id => {
-    const displayId = /^\d{6}$/.test(id) ? id : customId;
-    localStorage.setItem('myPeerId', displayId);
-    document.getElementById('myIdVal').textContent = displayId.slice(0,3) + ' ' + displayId.slice(3);
+    // id — это РЕАЛЬНЫЙ ID на сервере (может быть "vc140926" или UUID если сервер переназначил)
+    const displayId = toDisplayId(id);
+    const isExpected = (id === toServerId(customId));
+    
+    if (!isExpected) {
+      // Сервер не принял наш ID и выдал другой — обновляем
+      console.warn('[PeerJS] ⚠️ Сервер выдал другой ID:', id, '(ожидали:', toServerId(customId) + ')');
+      // Сохраняем только если это выглядит как наш формат
+      if (/^vc\d{6}$/.test(id)) {
+        const newDisplay = toDisplayId(id);
+        localStorage.setItem('myPeerId', newDisplay);
+        document.getElementById('myIdVal').textContent = newDisplay.slice(0,3) + ' ' + newDisplay.slice(3);
+        console.log('[PeerJS] ID обновлён на:', newDisplay);
+      } else {
+        // Сервер дал UUID — это плохо, попробуем другой сервер
+        console.error('[PeerJS] ❌ Сервер выдал UUID вместо нашего ID! Переключаем сервер...');
+        peer.destroy();
+        serverIndex++;
+        setTimeout(() => initPeer(customId), 1000);
+        return;
+      }
+    } else {
+      localStorage.setItem('myPeerId', customId);
+      document.getElementById('myIdVal').textContent = customId.slice(0,3) + ' ' + customId.slice(3);
+    }
+    
     setStatus('dot-green', 'Готово — ждём звонка');
     document.getElementById('callBtn').disabled =
       document.getElementById('callInput').value.trim().length < 6;
-    console.log('[PeerJS] ✅ Подключён к серверу. Мой ID:', id, '| отображаемый:', displayId);
-    console.log('[PeerJS] Peer.js сервер:', peer.options?.host || '0.peerjs.com (по умолчанию)');
+    console.log('[PeerJS] ✅ ID на сервере:', id, '| показываем:', toDisplayId(id));
+    console.log('[PeerJS] Сервер:', peer.options?.host);
   });
 
   peer.on('call', call => {
     incomingCall = call;
-    console.log('[PeerJS] 📞 Входящий звонок от:', call.peer);
-    document.getElementById('incomingId').textContent = call.peer;
+    const callerDisplay = toDisplayId(call.peer);
+    console.log('[PeerJS] 📞 Входящий звонок от:', call.peer, '| показываем:', callerDisplay);
+    document.getElementById('incomingId').textContent = callerDisplay;
     document.getElementById('screen-incoming').classList.add('show');
   });
 
@@ -760,13 +794,14 @@ function initPeer(customId) {
       // Собеседник не найден — самая частая ошибка
       const targetId = document.getElementById('callInput').value.trim();
       setStatus('dot-red', `Пир ${targetId} не найден. Он открыл страницу?`);
-      console.warn('[PeerJS] ℹ️  peer-unavailable: собеседник с ID', targetId,
+      console.warn('[PeerJS] ℹ️  peer-unavailable: собеседник с ID', targetId, '(на сервере:', toServerId(targetId) + ')',
         'не зарегистрирован на сервере.',
         '\nПроверь:',
         '\n  1. Вторая вкладка/устройство открыты и статус "Готово — ждём звонка"',
         '\n  2. ID введён точно (6 цифр без пробелов)',
         '\n  3. Обе страницы используют один и тот же сигнальный сервер');
     } else if (e.type === 'unavailable-id') {
+      console.warn('[PeerJS] ID занят, генерируем новый...');
       const newId = make6digit();
       localStorage.setItem('myPeerId', newId);
       initPeer(newId);
@@ -826,12 +861,14 @@ async function startCall() {
     return;
   }
 
+  const serverPeerId = toServerId(peerId);
+  console.log('[Call] Display ID:', peerId, '→ Server ID:', serverPeerId);
   setStatus('dot-yellow', 'Звоним…');
-  const call = peer.call(peerId, localStream, {
+  const call = peer.call(serverPeerId, localStream, {
     constraints: { iceServers: ICE_SERVERS }
   });
   console.log('[Call] peer.call() вызван. Объект call:', call);
-  const conn = peer.connect(peerId, { reliable: true });
+  const conn = peer.connect(serverPeerId, { reliable: true });
   setupDataConn(conn);
   handleCall(call);
 }
