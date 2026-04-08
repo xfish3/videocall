@@ -670,17 +670,55 @@ function initApp() {
   });
 }
 
+// Список сигнальных серверов с приоритетом (fallback)
+const PEER_SERVERS = [
+  // Официальный PeerJS cloud (бесплатный, но нестабильный)
+  { host: '0.peerjs.com', port: 443, path: '/', secure: true, key: 'peerjs' },
+  // Резервный — тот же хост, другой путь (иногда помогает при DNS-проблемах)
+  { host: 'peerjs-server.herokuapp.com', port: 443, path: '/', secure: true, key: 'peerjs' },
+];
+let serverIndex = 0;
+
 function initPeer(customId) {
   setStatus('dot-yellow', 'Подключаемся к серверу…');
-  console.log('[PeerJS] initPeer() →', customId);
+  const srv = PEER_SERVERS[serverIndex % PEER_SERVERS.length];
+  console.log('[PeerJS] initPeer() → ID:', customId, '| сервер:', srv.host);
 
   const opts = {
+    host: srv.host,
+    port: srv.port,
+    path: srv.path,
+    secure: srv.secure,
+    key: srv.key,
     config: { iceServers: ICE_SERVERS },
-    debug: 3  // 0=off, 1=errors, 2=warnings, 3=all — включаем максимальный лог
+    debug: 2,  // 1=errors, 2=warnings+errors, 3=all
+    pingInterval: 5000,
   };
   if (customId) opts.id = customId;
 
+  // Если старый peer жив — уничтожаем
+  if (peer && !peer.destroyed) {
+    try { peer.destroy(); } catch(e) {}
+  }
+
   peer = new Peer(opts);
+  
+  // Таймаут подключения — если за 8 секунд нет 'open', пробуем следующий сервер
+  const connectTimeout = setTimeout(() => {
+    if (!peer.open) {
+      console.warn('[PeerJS] ⏱ Таймаут подключения к', srv.host, '— пробуем следующий сервер');
+      serverIndex++;
+      if (serverIndex < PEER_SERVERS.length) {
+        initPeer(customId);
+      } else {
+        serverIndex = 0;
+        setStatus('dot-red', 'Нет связи с сервером. Перезагрузи страницу.');
+        console.error('[PeerJS] ❌ Все серверы недоступны.');
+      }
+    }
+  }, 8000);
+  
+  peer.once('open', () => clearTimeout(connectTimeout));
 
   peer.on('open', id => {
     const displayId = /^\d{6}$/.test(id) ? id : customId;
@@ -716,28 +754,29 @@ function initPeer(customId) {
   });
 
   peer.on('error', e => {
-    console.error('[PeerJS] ❌ Ошибка. type:', e.type, '| message:', e.message, '| объект:', e);
-    // Расшифровка типичных ошибок
-    const hints = {
-      'peer-unavailable':   '→ Пир с таким ID не найден на сервере. Проверь: он онлайн? ID совпадает?',
-      'not-open-yet':       '→ Peer ещё не подключился к серверу. Подожди open.',
-      'disconnected':       '→ Peer отключён от сигнального сервера.',
-      'invalid-id':         '→ Невалидный формат ID.',
-      'invalid-key':        '→ Неверный API-ключ PeerJS.',
-      'network':            '→ Сетевая ошибка — нет доступа к серверу PeerJS.',
-      'server-error':       '→ Ошибка сигнального сервера PeerJS.',
-      'socket-error':       '→ Ошибка WebSocket соединения.',
-      'socket-closed':      '→ WebSocket закрылся неожиданно.',
-      'unavailable-id':     '→ ID уже занят другим peer-ом.',
-    };
-    if (hints[e.type]) console.warn('[PeerJS] Подсказка:', hints[e.type]);
-
-    if (e.type === 'unavailable-id') {
+    console.error('[PeerJS] ❌ Ошибка. type:', e.type, '| message:', e.message);
+    
+    if (e.type === 'peer-unavailable') {
+      // Собеседник не найден — самая частая ошибка
+      const targetId = document.getElementById('callInput').value.trim();
+      setStatus('dot-red', `Пир ${targetId} не найден. Он открыл страницу?`);
+      console.warn('[PeerJS] ℹ️  peer-unavailable: собеседник с ID', targetId,
+        'не зарегистрирован на сервере.',
+        '\nПроверь:',
+        '\n  1. Вторая вкладка/устройство открыты и статус "Готово — ждём звонка"',
+        '\n  2. ID введён точно (6 цифр без пробелов)',
+        '\n  3. Обе страницы используют один и тот же сигнальный сервер');
+    } else if (e.type === 'unavailable-id') {
       const newId = make6digit();
       localStorage.setItem('myPeerId', newId);
       initPeer(newId);
+    } else if (e.type === 'network' || e.type === 'socket-error' || e.type === 'socket-closed' || e.type === 'server-error') {
+      console.warn('[PeerJS] Сетевая ошибка, пробуем переподключение...');
+      serverIndex++;
+      setTimeout(() => initPeer(localStorage.getItem('myPeerId')), 3000);
+      setStatus('dot-yellow', 'Переподключение к серверу…');
     } else {
-      setStatus('dot-red', 'Ошибка: ' + e.message);
+      setStatus('dot-red', 'Ошибка: ' + (e.message || e.type));
     }
   });
 }
@@ -855,7 +894,6 @@ function handleCall(call) {
       return;
     }
     console.log('[ICE] ✅ peerConnection получен. signalingState:', pc.signalingState);
-    (() => {
     pc.onicecandidate = e => {
       if (e.candidate) {
         console.log('[ICE] Новый кандидат:', e.candidate.type, e.candidate.address || '(адрес скрыт)', e.candidate.protocol);
@@ -870,10 +908,7 @@ function handleCall(call) {
       const s = pc.iceConnectionState;
       console.log('[ICE] connectionState →', s);
       if (s === 'failed') {
-        console.error('[ICE] ❌ ICE FAILED — соединение не установлено. Возможные причины:',
-          '\n  1. Оба пира за симметричным NAT (нужен TURN)',
-          '\n  2. TURN-сервер openrelay.metered.ca недоступен или заблокирован',
-          '\n  3. Firewall блокирует UDP/TCP для медиа');
+        console.error('[ICE] ❌ ICE FAILED — соединение не установлено.');
         setStatus('dot-red', 'ICE failed — нет p2p маршрута');
       }
       if (s === 'disconnected') {
@@ -886,7 +921,8 @@ function handleCall(call) {
     pc.onsignalingstatechange = () => {
       console.log('[RTCPeer] signalingState →', pc.signalingState);
     };
-  })();
+  }
+  setTimeout(attachIceListeners, 0);
 }
 
 // ════════════════════════════════════════
