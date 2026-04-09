@@ -241,17 +241,17 @@
     display: block;
   }
 
-  /* PiP — моё видео */
+  /* PiP — моё видео (размер как в WhatsApp) */
   .pip-wrap {
     position: absolute;
     bottom: 16px; right: 16px;
-    width: 110px; height: 82px;
-    border-radius: 12px;
+    width: 160px; height: 120px;
+    border-radius: 16px;
     overflow: hidden;
-    border: 2px solid rgba(255,255,255,0.25);
+    border: 2px solid rgba(255,255,255,0.3);
     cursor: grab;
     touch-action: none;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+    box-shadow: 0 6px 24px rgba(0,0,0,0.7);
     z-index: 10;
     transition: border-color 0.2s;
   }
@@ -469,7 +469,7 @@
   .weak-banner.show { display: block; }
 
   @media (max-width: 400px) {
-    .pip-wrap { width: 90px; height: 68px; }
+    .pip-wrap { width: 130px; height: 98px; }
     .ctrl { width: 48px; height: 48px; font-size: 20px; }
     .ctrl.end { width: 58px; height: 58px; }
     .my-id-val { font-size: 18px; letter-spacing: 2px; }
@@ -483,7 +483,7 @@
 ════════════════════════════════════════ -->
 <div id="screen-wait">
   <div class="app-title">📞 ВидеоСвязь</div>
-  <div class="app-sub">Безопасная связь без посредников.</div>
+  <div class="app-sub">Безопасная связь без посредников</div>
 
   <div class="card">
     <div class="card-label">Твой код</div>
@@ -608,22 +608,22 @@
 // TURN: freeturn.net — бесплатный публичный TURN, доступен из РФ
 //       + TCP-транспорт на порту 443 (его блокируют реже всего)
 const ICE_SERVERS = [
-  // STUN серверы вне российской блокировки
+  // STUN вне блокировок РФ
   { urls: 'stun:stun.cloudflare.com:3478' },
   { urls: 'stun:stun.nextcloud.com:3478' },
-  { urls: 'stun:relay.metered.ca:80' },
-  // TURN через freeturn.net (доступен из РФ, бесплатный)
-  { urls: 'turn:freeturn.net:3478',
-    username: 'free', credential: 'free' },
-  { urls: 'turn:freeturn.net:3479',
-    username: 'free', credential: 'free' },
-  { urls: 'turns:freeturn.net:5349',
-    username: 'free', credential: 'free' },
-  // TURN через Metered (зарегистрируйте аккаунт на metered.ca и вставьте свои данные)
-  // { urls: 'turn:relay.metered.ca:80',       username: 'ВАШ_USERNAME', credential: 'ВАШ_CREDENTIAL' },
-  // { urls: 'turn:relay.metered.ca:443',      username: 'ВАШ_USERNAME', credential: 'ВАШ_CREDENTIAL' },
-  // { urls: 'turn:relay.metered.ca:443?transport=tcp', username: 'ВАШ_USERNAME', credential: 'ВАШ_CREDENTIAL' },
+  // TURN #1 — freeturn.net
+  { urls: 'turn:freeturn.net:3478',      username: 'free', credential: 'free' },
+  { urls: 'turn:freeturn.net:3479',      username: 'free', credential: 'free' },
+  { urls: 'turns:freeturn.net:5349',     username: 'free', credential: 'free' },
+  // TURN #2 — anyfirewall (TCP 443, выглядит как HTTPS)
+  { urls: 'turn:turn.anyfirewall.com:443?transport=tcp', username: 'webrtc', credential: 'webrtc' },
+  // TURN #3 — numb.viagenie.ca (резервный)
+  { urls: 'turn:numb.viagenie.ca',       username: 'webrtc@live.com', credential: 'muazkh' },
+  { urls: 'turn:numb.viagenie.ca:443?transport=tcp', username: 'webrtc@live.com', credential: 'muazkh' },
 ];
+// relay = трафик всегда идёт через TURN-сервер (обязательно для РФ)
+// all   = сначала пробует прямое P2P (быстрее, но часто блокируется в РФ)
+const ICE_TRANSPORT_POLICY = 'relay';
 
 // ════════════════════════════════════════
 //  СОСТОЯНИЕ
@@ -634,6 +634,47 @@ let statsInterval, timerInterval, callSeconds = 0;
 let facingMode = 'user';
 let currentPc = null;
 let incomingCall = null;
+let ringtoneInterval = null;
+let audioCtx = null;
+
+// ════════════════════════════════════════
+//  РИНГТОН (Web Audio API — без внешних файлов)
+// ════════════════════════════════════════
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+function playRingBeep() {
+  try {
+    const ctx = getAudioCtx();
+    // Два тона как у классического телефонного звонка
+    const freqs = [480, 440];
+    const gainNode = ctx.createGain();
+    gainNode.connect(ctx.destination);
+    gainNode.gain.setValueAtTime(0.4, ctx.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.8);
+
+    freqs.forEach(freq => {
+      const osc = ctx.createOscillator();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(freq, ctx.currentTime);
+      osc.connect(gainNode);
+      osc.start(ctx.currentTime);
+      osc.stop(ctx.currentTime + 0.8);
+    });
+  } catch(e) {}
+}
+
+function startRingtone() {
+  stopRingtone();
+  playRingBeep();
+  ringtoneInterval = setInterval(playRingBeep, 1500);
+}
+
+function stopRingtone() {
+  if (ringtoneInterval) { clearInterval(ringtoneInterval); ringtoneInterval = null; }
+}
 
 // ════════════════════════════════════════
 //  КОНФИГУРАЦИЯ FIREBASE
@@ -724,7 +765,7 @@ function initPeer(shortCode) {
     path: '/',
     secure: true,
     debug: 0,
-    config: { iceServers: ICE_SERVERS }
+    config: { iceServers: ICE_SERVERS, iceTransportPolicy: ICE_TRANSPORT_POLICY }
   };
   peer = new Peer(peerOpts);
 
@@ -743,6 +784,7 @@ function initPeer(shortCode) {
     incomingCall = call;
     document.getElementById('incomingId').textContent = call.peer;
     document.getElementById('screen-incoming').classList.add('show');
+    startRingtone();
   });
 
   peer.on('connection', conn => {
@@ -818,6 +860,7 @@ async function startCall() {
 //  ПРИНЯТЬ / ОТКЛОНИТЬ ВХОДЯЩИЙ
 // ════════════════════════════════════════
 async function acceptCall() {
+  stopRingtone();
   document.getElementById('screen-incoming').classList.remove('show');
   try {
     await getLocalStream();
@@ -831,6 +874,7 @@ async function acceptCall() {
 }
 
 function rejectCall() {
+  stopRingtone();
   document.getElementById('screen-incoming').classList.remove('show');
   if (incomingCall) { incomingCall.close(); incomingCall = null; }
 }
