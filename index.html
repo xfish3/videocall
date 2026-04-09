@@ -241,11 +241,11 @@
     display: block;
   }
 
-  /* PiP — моё видео (размер как в WhatsApp) */
+  /* PiP — моё видео (размер как в WhatsApp, портретный формат) */
   .pip-wrap {
     position: absolute;
     bottom: 16px; right: 16px;
-    width: 160px; height: 120px;
+    width: 100px; height: 160px;
     border-radius: 16px;
     overflow: hidden;
     border: 2px solid rgba(255,255,255,0.3);
@@ -469,7 +469,7 @@
   .weak-banner.show { display: block; }
 
   @media (max-width: 400px) {
-    .pip-wrap { width: 130px; height: 98px; }
+    .pip-wrap { width: 85px; height: 136px; }
     .ctrl { width: 48px; height: 48px; font-size: 20px; }
     .ctrl.end { width: 58px; height: 58px; }
     .my-id-val { font-size: 18px; letter-spacing: 2px; }
@@ -483,7 +483,7 @@
 ════════════════════════════════════════ -->
 <div id="screen-wait">
   <div class="app-title">📞 ВидеоСвязь</div>
-  <div class="app-sub">Безопасная связь без посредников</div>
+  <div class="app-sub">Безопасная связь без посредников.</div>
 
   <div class="card">
     <div class="card-label">Твой код</div>
@@ -607,23 +607,25 @@
 // STUN: используем серверы НЕ от Google (они заблокированы в РФ)
 // TURN: freeturn.net — бесплатный публичный TURN, доступен из РФ
 //       + TCP-транспорт на порту 443 (его блокируют реже всего)
+// Используем 'all' — браузер сам выберет лучший путь:
+// прямое P2P если возможно, иначе через TURN.
+// 'relay'ломало соединение когда публичные TURN были недоступны.
+const ICE_TRANSPORT_POLICY = 'all';
+
 const ICE_SERVERS = [
-  // STUN вне блокировок РФ
+  // STUN — несколько независимых серверов
   { urls: 'stun:stun.cloudflare.com:3478' },
   { urls: 'stun:stun.nextcloud.com:3478' },
-  // TURN #1 — freeturn.net
-  { urls: 'turn:freeturn.net:3478',      username: 'free', credential: 'free' },
-  { urls: 'turn:freeturn.net:3479',      username: 'free', credential: 'free' },
-  { urls: 'turns:freeturn.net:5349',     username: 'free', credential: 'free' },
-  // TURN #2 — anyfirewall (TCP 443, выглядит как HTTPS)
-  { urls: 'turn:turn.anyfirewall.com:443?transport=tcp', username: 'webrtc', credential: 'webrtc' },
-  // TURN #3 — numb.viagenie.ca (резервный)
-  { urls: 'turn:numb.viagenie.ca',       username: 'webrtc@live.com', credential: 'muazkh' },
-  { urls: 'turn:numb.viagenie.ca:443?transport=tcp', username: 'webrtc@live.com', credential: 'muazkh' },
+  { urls: 'stun:stun.stunprotocol.org:3478' },
+  // TURN — freeturn.net (бесплатный, Европа)
+  { urls: 'turn:freeturn.net:3478',               username: 'free', credential: 'free' },
+  { urls: 'turn:freeturn.net:3479',               username: 'free', credential: 'free' },
+  { urls: 'turns:freeturn.net:5349',              username: 'free', credential: 'free' },
+  // TURN — metered open relay (резерв)
+  { urls: 'turn:a.relay.metered.ca:80',           username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:a.relay.metered.ca:443',          username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:a.relay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
 ];
-// relay = трафик всегда идёт через TURN-сервер (обязательно для РФ)
-// all   = сначала пробует прямое P2P (быстрее, но часто блокируется в РФ)
-const ICE_TRANSPORT_POLICY = 'relay';
 
 // ════════════════════════════════════════
 //  СОСТОЯНИЕ
@@ -639,37 +641,58 @@ let audioCtx = null;
 
 // ════════════════════════════════════════
 //  РИНГТОН (Web Audio API — без внешних файлов)
+//  AudioContext создаётся при первом касании экрана —
+//  браузеры запрещают звук без действия пользователя.
 // ════════════════════════════════════════
-function getAudioCtx() {
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  return audioCtx;
+let audioCtxReady = false;
+
+function ensureAudioCtx() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+  if (audioCtx.state === 'suspended') {
+    audioCtx.resume();
+  }
+  audioCtxReady = true;
 }
+
+// Инициализируем AudioContext при первом касании/клике
+document.addEventListener('touchstart', ensureAudioCtx, { once: true });
+document.addEventListener('mousedown',  ensureAudioCtx, { once: true });
+document.addEventListener('keydown',    ensureAudioCtx, { once: true });
 
 function playRingBeep() {
   try {
-    const ctx = getAudioCtx();
-    // Два тона как у классического телефонного звонка
-    const freqs = [480, 440];
-    const gainNode = ctx.createGain();
-    gainNode.connect(ctx.destination);
-    gainNode.gain.setValueAtTime(0.4, ctx.currentTime);
-    gainNode.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.8);
+    if (!audioCtx) return;
+    if (audioCtx.state === 'suspended') audioCtx.resume();
 
-    freqs.forEach(freq => {
-      const osc = ctx.createOscillator();
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(freq, ctx.currentTime);
-      osc.connect(gainNode);
-      osc.start(ctx.currentTime);
-      osc.stop(ctx.currentTime + 0.8);
+    const t = audioCtx.currentTime;
+    const gain = audioCtx.createGain();
+    gain.connect(audioCtx.destination);
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(0.5, t + 0.05);
+    gain.gain.setValueAtTime(0.5, t + 0.35);
+    gain.gain.linearRampToValueAtTime(0, t + 0.45);
+
+    // Двойной бип
+    [0, 0.5].forEach(offset => {
+      [440, 480].forEach(freq => {
+        const osc = audioCtx.createOscillator();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        osc.connect(gain);
+        osc.start(t + offset);
+        osc.stop(t + offset + 0.45);
+      });
     });
-  } catch(e) {}
+  } catch(e) { console.warn('ringtone error', e); }
 }
 
 function startRingtone() {
   stopRingtone();
+  if (!audioCtx) return; // нет взаимодействия — звука не будет, это норма
   playRingBeep();
-  ringtoneInterval = setInterval(playRingBeep, 1500);
+  ringtoneInterval = setInterval(playRingBeep, 2000);
 }
 
 function stopRingtone() {
@@ -755,24 +778,42 @@ function initApp() {
 function initPeer(shortCode) {
   setStatus('dot-yellow', 'Подключаемся к серверу…');
 
-  // ── PeerJS сервер ─────────────────────────────────────────────────────────
-  // 0.peerjs.com заблокирован в России.
-  // Используем бесплатный публичный PeerJS-сервер на peerjs.com/peerserver
-  // или разверните свой: https://github.com/peers/peerjs-server (бесплатно на Render/Railway)
+  // Пробуем несколько PeerJS серверов по очереди.
+  // peerjs.92k.de иногда недоступен — добавляем фоллбэк на 0.peerjs.com.
+  // Если оба недоступны из РФ — используется встроенный Firebase-сигналинг.
+  tryInitPeer(shortCode, [
+    { host: 'peerjs.92k.de',         port: 443, path: '/', secure: true },
+    { host: '0.peerjs.com',           port: 443, path: '/', secure: true },
+  ], 0);
+}
+
+function tryInitPeer(shortCode, servers, idx) {
+  if (idx >= servers.length) {
+    setStatus('dot-red', 'Нет связи с сервером. Проверьте интернет.');
+    return;
+  }
+
+  const srv = servers[idx];
   const peerOpts = {
-    host: 'peerjs.92k.de',   // бесплатный публичный PeerJS-сервер, вне РФ-блокировок
-    port: 443,
-    path: '/',
-    secure: true,
+    host: srv.host, port: srv.port, path: srv.path, secure: srv.secure,
     debug: 0,
     config: { iceServers: ICE_SERVERS, iceTransportPolicy: ICE_TRANSPORT_POLICY }
   };
+
+  if (peer) { try { peer.destroy(); } catch(e){} }
   peer = new Peer(peerOpts);
 
+  // Таймаут подключения — если за 8 сек не открылся, пробуем следующий сервер
+  const connectTimeout = setTimeout(() => {
+    if (!peer || peer.disconnected) {
+      console.warn(`PeerJS сервер ${srv.host} недоступен, пробуем следующий…`);
+      tryInitPeer(shortCode, servers, idx + 1);
+    }
+  }, 8000);
+
   peer.on('open', async peerUUID => {
-    // Сохраняем настоящий PeerJS UUID
+    clearTimeout(connectTimeout);
     localStorage.setItem('myPeerUUID', peerUUID);
-    // Регистрируем в Google Sheets: shortCode → peerUUID
     setStatus('dot-yellow', 'Регистрируем код…');
     await registerInSheet(shortCode, peerUUID);
     setStatus('dot-green', 'Готово — ждём звонка');
@@ -797,8 +838,14 @@ function initPeer(shortCode) {
   });
 
   peer.on('error', e => {
-    setStatus('dot-red', 'Ошибка соединения');
-    console.error('PeerJS error:', e);
+    clearTimeout(connectTimeout);
+    console.error('PeerJS error:', e.type, e);
+    if (e.type === 'server-error' || e.type === 'network' || e.type === 'socket-error') {
+      setStatus('dot-yellow', `Сервер ${srv.host} недоступен, пробуем другой…`);
+      tryInitPeer(shortCode, servers, idx + 1);
+    } else {
+      setStatus('dot-red', 'Ошибка: ' + e.type);
+    }
   });
 }
 
