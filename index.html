@@ -483,7 +483,7 @@
 ════════════════════════════════════════ -->
 <div id="screen-wait">
   <div class="app-title">📞 ВидеоСвязь</div>
-  <div class="app-sub">Безопасная связь без посредников</div>
+  <div class="app-sub">Безопасная связь без посредников.</div>
 
   <div class="card">
     <div class="card-label">Твой код</div>
@@ -722,15 +722,25 @@ function initRingtone() {
     const uri = makeRingtoneDataURI();
     ringtoneAudio = new Audio(uri);
     ringtoneAudio.loop = true;
-    ringtoneAudio.volume = 0.8;
-  } catch(e) { console.warn('ringtone init error', e); }
+ringtoneAudio.volume = 0.8;
+    // Разблокировка звука при первом касании
+    const unlock = () => {
+      ringtoneAudio.play().then(() => { ringtoneAudio.pause(); ringtoneAudio.currentTime = 0; }).catch(()=>{});
+      document.removeEventListener('touchstart', unlock);
+      document.removeEventListener('mousedown', unlock);
+    };
+    document.addEventListener('touchstart', unlock, { passive: true });
+    document.addEventListener('mousedown', unlock);
+  } catch(e) { console.warn('ringtone init error', e); }  
 }
 
 function startRingtone() {
-  stopRingtone();
   if (!ringtoneAudio) return;
   ringtoneAudio.currentTime = 0;
-  ringtoneAudio.play().catch(() => {});
+  const tryPlay = () => {
+    ringtoneAudio.play().catch(() => { setTimeout(tryPlay, 300); });
+  };
+  tryPlay();
 }
 
 function stopRingtone() {
